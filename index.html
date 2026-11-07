@@ -649,11 +649,12 @@ tailwind.config = {
           <div class="grid grid-cols-3 gap-2">
             <div>
               <label class="block text-[11px] text-slate-500 mb-1.5 font-medium">CEP</label>
-              <input type="text" id="orc-cep" required maxlength="9" onblur="buscarCep(this.value)" class="input font-mono" placeholder="00000-000">
+              <input type="text" id="orc-cep" required inputmode="numeric" maxlength="9" oninput="alterarCep(this, 'orc')" onblur="finalizarCep(this, 'orc')" class="input font-mono" placeholder="00000-000">
             </div>
             <div class="col-span-2">
-              <label class="block text-[11px] text-slate-500 mb-1.5 font-medium">Rua (auto)</label>
-              <input type="text" id="orc-endereco" readonly class="input" placeholder="Aguardando CEP...">
+              <label class="block text-[11px] text-slate-500 mb-1.5 font-medium">Endereço (automático ou manual)</label>
+              <input type="text" id="orc-endereco" class="input" placeholder="Rua, bairro, cidade/UF">
+              <p id="orc-cep-status" class="text-[10px] text-slate-500 mt-1" aria-live="polite"></p>
             </div>
           </div>
           <div class="grid grid-cols-2 gap-2">
@@ -721,7 +722,7 @@ tailwind.config = {
             <div class="grid grid-cols-2 gap-2">
               <div>
                 <label class="block text-[11px] text-slate-500 mb-1.5 font-medium">Forma do restante</label>
-                <select id="orc-restante-tipo" class="input">
+                <select id="orc-restante-tipo" class="input" onchange="atualizarRepasseCartao()">
                   <option value="Cartão de Crédito">Cartão de Crédito</option>
                   <option value="Cartão de Débito">Cartão de Débito</option>
                   <option value="Pix">Pix</option>
@@ -730,8 +731,16 @@ tailwind.config = {
               </div>
               <div>
                 <label class="block text-[11px] text-slate-500 mb-1.5 font-medium">Nº de parcelas</label>
-                <input type="number" id="orc-parcelas" min="1" max="24" value="1" class="input font-mono" oninput="calcularParcelas()">
+                <input type="number" id="orc-parcelas" min="1" max="24" value="1" class="input font-mono" oninput="calcularParcelas(); atualizarResumoRepasseCartao()">
               </div>
+            </div>
+            <div id="bloco-repasse-cartao" class="hidden bg-blue-50 rounded-xl p-3 border border-blue-200">
+              <label for="orc-repasse-cartao" class="block text-[11px] text-slate-600 mb-1.5 font-semibold">Como a operadora repassará o valor para você?</label>
+              <select id="orc-repasse-cartao" class="input" onchange="atualizarResumoRepasseCartao()">
+                <option value="total">Valor total em um único repasse</option>
+                <option value="parcelado">Em repasses parcelados</option>
+              </select>
+              <p id="orc-repasse-cartao-ajuda" class="text-[10px] text-slate-500 mt-2">Previsto como um único repasse. Registre como recebido somente quando o valor entrar.</p>
             </div>
             <div class="bg-slate-50 rounded-xl p-3 text-xs space-y-1 border border-slate-200">
               <div class="flex justify-between"><span class="text-slate-500">Total:</span><span id="calc-total" class="text-slate-900 font-medium">R$ 0,00</span></div>
@@ -1182,33 +1191,53 @@ function gerarParcelas(orc, dataBase) {
   const p = orc.pagamento || {};
   const base = dataBase ? new Date(dataBase) : new Date();
   const parcelas = [];
+  const idBase = 'P-' + Date.now();
 
-  if (p.tipo === 'Entrada + Parcelas' && p.entrada > 0) {
-    parcelas.push({
-      id: 'P-' + Date.now() + '-E',
-      descricao: `Entrada (${p.entradaTipo || 'Pix'})`,
-      valor: p.entrada,
-      vencimento: new Date(base).toISOString().slice(0, 10),
-      status: 'Pendente', tipo: 'entrada'
-    });
-    for (let i = 1; i <= p.parcelas; i++) {
-      const venc = new Date(base);
-      venc.setMonth(venc.getMonth() + i);
+  if (p.tipo === 'Entrada + Parcelas') {
+    const entrada = Math.max(0, Number(p.entrada) || 0);
+    const n = Math.max(1, Math.min(24, parseInt(p.parcelas, 10) || 1));
+    const restante = Math.max(0, (Number(orc.valor) || 0) - entrada);
+    if (entrada > 0) {
       parcelas.push({
-        id: 'P-' + Date.now() + '-P' + i,
-        descricao: `Parcela ${i}/${p.parcelas} (${p.restanteTipo || 'Cartão'})`,
-        valor: p.valorParcela,
-        vencimento: venc.toISOString().slice(0, 10),
-        status: 'Pendente', tipo: 'parcela',
-        numero: i, total: p.parcelas
+        id: idBase + '-E', descricao: `Entrada (${p.entradaTipo || 'Pix'})`,
+        valor: entrada, vencimento: new Date(base).toISOString().slice(0, 10),
+        status: 'Pendente', tipo: 'entrada'
       });
+    }
+
+    // Para vendas novas no cartão, o repasse é uma previsão separada do parcelamento do cliente.
+    // Sem essa informação (dados antigos), preserva-se o comportamento histórico.
+    const repasseTotal = p.restanteTipo === 'Cartão de Crédito' && p.repasseCartao === 'total';
+    const parcelasRepasse = p.restanteTipo === 'Cartão de Crédito' && p.repasseCartao === 'parcelado';
+    if (repasseTotal) {
+      if (restante > 0) parcelas.push({
+        id: idBase + '-RT', descricao: 'Repasse total da operadora (cartão)',
+        valor: restante, vencimento: new Date(base).toISOString().slice(0, 10),
+        status: 'Pendente', tipo: 'repasse-cartao-total'
+      });
+    } else {
+      const dividirCentavos = Math.round(restante * 100);
+      const parcelaBase = Math.floor(dividirCentavos / n);
+      const sobra = dividirCentavos - parcelaBase * n;
+      for (let i = 1; i <= n; i++) {
+        const venc = new Date(base);
+        venc.setMonth(venc.getMonth() + i);
+        const valorParcela = (parcelaBase + (i <= sobra ? 1 : 0)) / 100;
+        parcelas.push({
+          id: idBase + '-P' + i,
+          descricao: parcelasRepasse
+            ? `Repasse ${i}/${n} da operadora (cartão)`
+            : `Parcela ${i}/${n} (${p.restanteTipo || 'Cartão'})`,
+          valor: valorParcela, vencimento: venc.toISOString().slice(0, 10),
+          status: 'Pendente', tipo: parcelasRepasse ? 'repasse-cartao-parcela' : 'parcela',
+          numero: i, total: n
+        });
+      }
     }
   } else {
     parcelas.push({
-      id: 'P-' + Date.now() + '-U',
-      descricao: `Pagamento único (${p.tipo || 'Pix'})`,
-      valor: orc.valor,
-      vencimento: new Date(base).toISOString().slice(0, 10),
+      id: idBase + '-U', descricao: `Pagamento único (${p.tipo || 'Pix'})`,
+      valor: orc.valor, vencimento: new Date(base).toISOString().slice(0, 10),
       status: 'Pendente', tipo: 'unico'
     });
   }
@@ -1933,11 +1962,12 @@ function abrirPerfil() {
       <div class="grid grid-cols-3 gap-2">
         <div>
           <label class="block text-[11px] text-neutral-500 mb-1.5">CEP</label>
-          <input type="text" id="pf-cep" class="input font-mono" maxlength="9" value="${p.cep || ''}" placeholder="00000-000" onblur="buscarCepPerfil(this.value)">
+          <input type="text" id="pf-cep" class="input font-mono" maxlength="9" value="${p.cep || ''}" placeholder="00000-000" inputmode="numeric" oninput="alterarCep(this, 'pf')" onblur="finalizarCep(this, 'pf')">
         </div>
         <div class="col-span-2">
           <label class="block text-[11px] text-neutral-500 mb-1.5">Endereço</label>
           <input type="text" id="pf-endereco" class="input" value="${p.endereco || ''}" placeholder="Rua, nº, bairro">
+          <p id="pf-cep-status" class="text-[10px] text-neutral-400 mt-1" aria-live="polite"></p>
         </div>
       </div>
     </div>
@@ -1986,18 +2016,6 @@ function salvarPerfil() {
   fecharModalGenerico();
 }
 
-async function buscarCepPerfil(cep) {
-  cep = (cep || '').replace(/\D/g, '');
-  if (cep.length !== 8) return;
-  try {
-    const res = await fetch(`https://viacep.com.br/ws/${cep}/json/`);
-    const data = await res.json();
-    if (!data.erro) {
-      document.getElementById('pf-endereco').value = `${data.logradouro}, ${data.bairro} - ${data.localidade}/${data.uf}`;
-      toast('Endereço preenchido', 'sucesso');
-    }
-  } catch(e) {}
-}
 
 function escolherAvatar() { document.getElementById('input-avatar').click(); }
 
@@ -2085,25 +2103,74 @@ function mascaraTelefone(input) {
   else input.value = `(${v.slice(0,2)}) ${v.slice(2,7)}-${v.slice(7)}`;
 }
 
-async function buscarCep(cep) {
-  cep = (cep || '').replace(/\D/g, '');
-  if (cep.length !== 8) return;
-  const campo = document.getElementById('orc-endereco');
-  campo.value = 'Buscando...';
-  try {
-    const res = await fetch(`https://viacep.com.br/ws/${cep}/json/`);
-    const data = await res.json();
-    if (data.erro) {
-      campo.value = '';
-      toast('CEP não encontrado', 'erro');
-    } else {
-      campo.value = `${data.logradouro}, ${data.bairro} - ${data.localidade}/${data.uf}`;
-      toast('Endereço preenchido', 'sucesso');
-    }
-  } catch(e) {
-    campo.value = '';
-    toast('Erro ao buscar CEP', 'erro');
+// Consulta automática, com opção de preenchimento manual e proteção contra respostas antigas.
+function alterarCep(input, prefixo) {
+  const numeros = input.value.replace(/\D/g, '').slice(0, 8);
+  input.value = numeros.length > 5 ? numeros.slice(0, 5) + '-' + numeros.slice(5) : numeros;
+  const status = document.getElementById(prefixo + '-cep-status');
+  const endereco = document.getElementById(prefixo + '-endereco');
+  if (input.dataset.ultimoCep && input.dataset.ultimoCep !== numeros) {
+    if (endereco.value === input.dataset.enderecoAutomatico) endereco.value = '';
+    delete input.dataset.ultimoCep;
+    delete input.dataset.enderecoAutomatico;
   }
+  if (numeros.length === 8) consultarCep(input, prefixo, numeros);
+  else {
+    delete input.dataset.cepEmBusca;
+    if (status) status.textContent = numeros ? 'Digite os 8 números do CEP.' : '';
+  }
+}
+
+function finalizarCep(input, prefixo) {
+  const numeros = input.value.replace(/\D/g, '');
+  if (numeros.length === 8) consultarCep(input, prefixo, numeros);
+  else if (numeros.length) {
+    const status = document.getElementById(prefixo + '-cep-status');
+    if (status) status.textContent = 'CEP incompleto. Digite os 8 números.';
+  }
+}
+
+async function consultarCep(input, prefixo, cep) {
+  if (input.dataset.cepEmBusca === cep || input.dataset.ultimoCep === cep) return;
+  input.dataset.cepEmBusca = cep;
+  const campo = document.getElementById(prefixo + '-endereco');
+  const status = document.getElementById(prefixo + '-cep-status');
+  const valorInicial = campo.value;
+  if (status) status.textContent = 'Buscando endereço...';
+  let endereco = '';
+  for (const fonte of ['viacep', 'brasilapi']) {
+    if (input.value.replace(/\D/g, '') !== cep || input.dataset.cepEmBusca !== cep) return;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    try {
+      const url = fonte === 'viacep' ? `https://viacep.com.br/ws/${cep}/json/` : `https://brasilapi.com.br/api/cep/v1/${cep}`;
+      const resposta = await fetch(url, { signal: controller.signal });
+      if (!resposta.ok) throw new Error('Consulta indisponível');
+      const dados = await resposta.json();
+      if (dados.erro) throw new Error('CEP não encontrado');
+      const rua = fonte === 'viacep' ? dados.logradouro : dados.street;
+      const bairro = fonte === 'viacep' ? dados.bairro : dados.neighborhood;
+      const cidade = fonte === 'viacep' ? dados.localidade : dados.city;
+      const uf = fonte === 'viacep' ? dados.uf : dados.state;
+      endereco = [rua, bairro, [cidade, uf].filter(Boolean).join('/')].filter(Boolean).join(', ');
+      if (endereco) break;
+    } catch (e) { /* tenta a próxima fonte */ }
+    finally { clearTimeout(timer); }
+  }
+  if (input.value.replace(/\D/g, '') !== cep || input.dataset.cepEmBusca !== cep) return;
+  delete input.dataset.cepEmBusca;
+  if (!endereco) {
+    if (status) status.textContent = 'Não foi possível encontrar o endereço. Preencha manualmente.';
+    return;
+  }
+  if (campo.value !== valorInicial) {
+    if (status) status.textContent = 'Endereço não alterado porque você já o editou.';
+    return;
+  }
+  campo.value = endereco;
+  input.dataset.ultimoCep = cep;
+  input.dataset.enderecoAutomatico = endereco;
+  if (status) status.textContent = 'Endereço encontrado. Confira e informe o número.';
 }
 
 function togglePagamentoCampos() {
@@ -2111,10 +2178,28 @@ function togglePagamentoCampos() {
   const bloco = document.getElementById('bloco-entrada');
   if (tipo === 'Entrada + Parcelas') {
     bloco.classList.remove('hidden');
+    atualizarRepasseCartao();
     calcularParcelas();
   } else {
     bloco.classList.add('hidden');
+    document.getElementById('bloco-repasse-cartao')?.classList.add('hidden');
   }
+}
+
+function atualizarRepasseCartao() {
+  const visivel = document.getElementById('orc-pagamento')?.value === 'Entrada + Parcelas'
+    && document.getElementById('orc-restante-tipo')?.value === 'Cartão de Crédito';
+  document.getElementById('bloco-repasse-cartao')?.classList.toggle('hidden', !visivel);
+  atualizarResumoRepasseCartao();
+}
+
+function atualizarResumoRepasseCartao() {
+  const modo = document.getElementById('orc-repasse-cartao')?.value || 'total';
+  const ajuda = document.getElementById('orc-repasse-cartao-ajuda');
+  const n = Math.max(1, Math.min(24, parseInt(document.getElementById('orc-parcelas')?.value, 10) || 1));
+  if (ajuda) ajuda.textContent = modo === 'parcelado'
+    ? `Previsão de ${n} repasses mensais, no mesmo número de parcelas do cartão. Confirme cada recebimento quando o dinheiro entrar.`
+    : 'Previsto como um único repasse. Confirme o recebimento somente quando o valor entrar; taxas da operadora não estão incluídas nesta previsão.';
 }
 
 function calcularParcelas() {
@@ -2143,12 +2228,17 @@ function salvarOrcamento(e) {
   if (tipoPag === 'Entrada + Parcelas') {
     const entrada = parseFloat(document.getElementById('orc-entrada').value) || 0;
     const nParc = parseInt(document.getElementById('orc-parcelas').value) || 1;
+    if (entrada < 0 || entrada > valor) { toast('A entrada deve ficar entre R$ 0,00 e o valor total', 'erro'); return; }
+    if (nParc < 1 || nParc > 24) { toast('Informe de 1 a 24 parcelas', 'erro'); return; }
     const restante = Math.max(valor - entrada, 0);
     pagamento.entrada = entrada;
     pagamento.entradaTipo = document.getElementById('orc-entrada-tipo').value;
     pagamento.restanteTipo = document.getElementById('orc-restante-tipo').value;
     pagamento.parcelas = nParc;
     pagamento.valorParcela = nParc > 0 ? restante / nParc : 0;
+    pagamento.repasseCartao = pagamento.restanteTipo === 'Cartão de Crédito'
+      ? (document.getElementById('orc-repasse-cartao').value || 'total')
+      : null;
   }
 
   const numeroOrc = gerarNumeroOrcamento();
@@ -2176,7 +2266,14 @@ function salvarOrcamento(e) {
   db.orcamentos.unshift(novo);
   salvar();
   document.getElementById('form-orcamento').reset();
+  const cepInput = document.getElementById('orc-cep');
+  delete cepInput.dataset.ultimoCep;
+  delete cepInput.dataset.enderecoAutomatico;
+  delete cepInput.dataset.cepEmBusca;
+  document.getElementById('orc-cep-status').textContent = '';
   document.getElementById('orc-endereco').value = '';
+  document.getElementById('orc-repasse-cartao').value = 'total';
+  document.getElementById('bloco-repasse-cartao').classList.add('hidden');
   document.getElementById('bloco-entrada').classList.add('hidden');
   atualizarPreviewNumero();
   toast(`Orçamento ${numeroOrc} cadastrado!`, 'sucesso');
@@ -2545,9 +2642,58 @@ function confirmarGasto(id, tipo) {
   toast(`${labels[tipo]}: + ${formatBRL(val)}`, 'sucesso');
 }
 
+function escaparHtml(valor) {
+  return String(valor ?? '').replace(/[&<>\"']/g, caractere => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', "'": '&#39;'
+  })[caractere]);
+}
+
+function editarObra(id) {
+  const o = db.obras.find(item => item.id === id);
+  if (!o) return;
+  const html = `
+    <div class="mb-4">
+      <h3 class="font-display text-lg font-bold">Editar dados da obra</h3>
+      <p class="text-xs text-neutral-500 mt-1">As alterações não mudam gastos, recebimentos ou parcelas já cadastrados.</p>
+    </div>
+    <div class="space-y-3">
+      <div><label class="block text-[11px] text-neutral-500 mb-1.5">Nome da obra</label>
+        <input id="ed-obra-nome" class="input" maxlength="120" value="${escaparHtml(o.obra)}" required></div>
+      <div><label class="block text-[11px] text-neutral-500 mb-1.5">Cliente</label>
+        <input id="ed-obra-cliente" class="input" maxlength="120" value="${escaparHtml(o.cliente)}" required></div>
+      <div><label class="block text-[11px] text-neutral-500 mb-1.5">Telefone</label>
+        <input id="ed-obra-telefone" class="input" maxlength="30" value="${escaparHtml(o.telefone)}"></div>
+      <div><label class="block text-[11px] text-neutral-500 mb-1.5">Endereço completo</label>
+        <input id="ed-obra-endereco" class="input" maxlength="240" value="${escaparHtml(o.endereco)}"></div>
+      <div><label class="block text-[11px] text-neutral-500 mb-1.5">Descrição do serviço</label>
+        <textarea id="ed-obra-descricao" class="input" rows="3" maxlength="2000" style="resize:vertical">${escaparHtml(o.descricao)}</textarea></div>
+    </div>
+    <div class="flex gap-2 mt-4">
+      <button onclick="fecharModalGenerico()" class="btn btn-ghost flex-1">Cancelar</button>
+      <button onclick="salvarEdicaoObra('${escaparHtml(o.id)}')" class="btn btn-primary flex-1"><i class="fa-solid fa-check text-xs"></i> Salvar alterações</button>
+    </div>`;
+  abrirModalGenerico(html);
+}
+
+function salvarEdicaoObra(id) {
+  const o = db.obras.find(item => item.id === id);
+  if (!o) return;
+  const nome = document.getElementById('ed-obra-nome').value.trim();
+  const cliente = document.getElementById('ed-obra-cliente').value.trim();
+  if (!nome || !cliente) { toast('Informe o nome da obra e do cliente', 'erro'); return; }
+  o.obra = nome;
+  o.cliente = cliente;
+  o.telefone = document.getElementById('ed-obra-telefone').value.trim();
+  o.endereco = document.getElementById('ed-obra-endereco').value.trim();
+  o.descricao = document.getElementById('ed-obra-descricao').value.trim();
+  salvar();
+  fecharModalGenerico();
+  toast('Dados da obra atualizados!', 'sucesso');
+}
+
 function excluirObra(id) {
   solicitarSenhaGastos(() => {
-    if (!confirm('Excluir esta obra? Esta ação não pode ser desfeita.')) return;
+    if (!confirm('Excluir esta obra permanentemente? Os dados da obra, fotos, gastos, recebimentos e parcelas serão removidos deste aparelho. O orçamento original continuará na lista. Esta ação não pode ser desfeita.')) return;
     db.obras = db.obras.filter(o => o.id !== id);
     salvar();
     toast('Obra excluída', 'info');
@@ -3576,10 +3722,14 @@ function renderObras() {
             </div>
           </div>
 
-          <button onclick="excluirObra('${o.id}')" class="btn btn-ghost w-full mt-2" style="color:#ef4444;border-color:rgba(239,68,68,0.2)">
-            <i class="fa-solid fa-trash text-xs"></i>
-            Excluir obra
-          </button>
+          <div class="grid grid-cols-2 gap-2 mt-2">
+            <button onclick="editarObra('${o.id}')" class="btn btn-ghost">
+              <i class="fa-solid fa-pen text-xs text-blue-neon"></i> Editar dados
+            </button>
+            <button onclick="excluirObra('${o.id}')" class="btn btn-ghost" style="color:#ef4444;border-color:rgba(239,68,68,0.2)">
+              <i class="fa-solid fa-trash text-xs"></i> Excluir obra
+            </button>
+          </div>
         </div>
       </div>`;
   }).join('');
